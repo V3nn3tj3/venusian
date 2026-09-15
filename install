@@ -260,6 +260,10 @@ gen_user() {
     chr /sbin/adduser $NAME dialout 2>/dev/null
     test $DEBARCH != "amd64" || chr /sbin/adduser $NAME bluetooth 2>/dev/null
     test ! -v FB || chr /sbin/adduser $NAME video 2>/dev/null
+	
+	# Add passwordless sudo for the venus user and ip commands
+	echo "venus ALL=(ALL) NOPASSWD: /usr/bin/ip, /usr/sbin/ip" | tee "$R/etc/sudoers.d/venus" > /dev/null
+	chmod 0440 "$R/etc/sudoers.d/venus"
 
     SC="$LIBV/.config/systemd/user.control"
     mkdir -p "$R/$SC/default.target.wants/"
@@ -484,6 +488,12 @@ ExecStartPre=+chown %i /run/venusian/%i
 
 [Install]
 WantedBy=default.target
+_END_
+
+    # Make sure systemd-binfmt is loaded into memory
+    fcat "$R/etc/systemd/system/venusian@.service.d/binfmt-fix.conf" <<_END_
+[Service]
+ExecStartPre=+/usr/lib/systemd/systemd-binfmt
 _END_
 
     # Venus service (shortcut)

@@ -13,6 +13,7 @@ import pwd
 import anyio
 import socket
 import shlex
+import subprocess
 from asyncdbus import MessageBus, Message, Variant
 from pprint import pprint
 from pathlib import Path
@@ -138,6 +139,7 @@ class Handler:
         self.known = dict()
         self._reload_done = None
         self._reload_evt = anyio.Lock()
+        self._venusian_ns = None  # cached by _get_netns()
 
     async def run(self):
         bus = f"unix:path=/run/user/{self.uid}/bus"
@@ -199,14 +201,227 @@ class Handler:
 #       self.intro_service = await self.dbus.introspect(
 #           'org.freedesktop.systemd1.Service', '/org/freedesktop/systemd1/unit/dbus_2eservice')
 
+    def _get_netns(self) -> str:
+        "Find (and cache) the name of our own network namespace under /run/netns."
+        if self._venusian_ns is None:
+            ns = "venusian-venus"
+            try:
+                current_ns_link = os.readlink("/proc/self/ns/net")
+                if os.path.exists("/run/netns"):
+                    for ns_name in os.listdir("/run/netns"):
+                        if os.readlink(os.path.join("/run/netns", ns_name)) == current_ns_link:
+                            ns = ns_name
+                            break
+            except OSError:
+                pass
+            self._venusian_ns = ns
+        return self._venusian_ns
+
+    @staticmethod
+    def _run_sync(*args: str, **kw):
+        "subprocess.run with sane defaults; used for the blocking helpers below."
+        kw.setdefault("stdout", subprocess.PIPE)
+        kw.setdefault("stderr", subprocess.DEVNULL)
+        kw.setdefault("text", True)
+        kw.setdefault("check", False)
+        return subprocess.run(list(args), **kw)
+
+    async def _to_thread(self, *args: str, **kw):
+        "Run a (blocking) command off the trio event loop, so it can't stall dbus."
+        return await anyio.to_thread.run_sync(lambda: self._run_sync(*args, **kw))
+
+    async def _ns_exec(self, ns: str, *args: str, **kw):
+        "await 'sudo ip netns exec NS args...' without blocking the event loop."
+        return await self._to_thread("sudo", "ip", "netns", "exec", ns, *args, **kw)
+
+    @staticmethod
+    def _parse_can_ifaces(res) -> list[str]:
+        "Interface names out of an 'ip link show type can' result."
+        if res.returncode != 0:
+            return []
+        return [line.split(":")[1].strip()
+                for line in res.stdout.splitlines() if ":" in line and "can" in line]
+
+    async def _can_ifaces(self, ns: str) -> list[str]:
+        "CAN interfaces currently visible inside namespace `ns`."
+        return self._parse_can_ifaces(await self._ns_exec(ns, "ip", "link", "show", "type", "can"))
+
+    async def _process_can_devices(self) -> None:
+        """Detect, configure, and setup CAN network interfaces."""
+        processed_can_devices = []
+        try:
+            venusian_ns = self._get_netns()
+
+            for target_attempt in range(20):
+                pid_res = await self._to_thread("ip", "netns", "pids", venusian_ns)
+                venus_pid = pid_res.stdout.split()[0] if pid_res.stdout.split() else ""
+                if venus_pid and os.path.isdir(f"/proc/{venus_pid}/root/run"):
+                    await anyio.sleep(1.5)
+                    break
+                await anyio.sleep(0.5)
+
+            for boot_attempt in range(40):
+                host_cans = await self._can_ifaces("root")
+                guest_cans = await self._can_ifaces(venusian_ns)
+
+                total_cans = len(host_cans) + len(guest_cans)
+                if total_cans > 0:
+                    logger.info("Detection successful: Found %s CAN interface(s) on host (%s) and %s in guest (%s).", 
+                                len(host_cans), host_cans, len(guest_cans), guest_cans)
+                    break
+                await anyio.sleep(0.5)
+
+            try:
+                res = await self._to_thread("systemctl", "--user", "list-units", "*can*.service", "--plain", "--no-legend")
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.splitlines():
+                        parts = line.strip().split()
+                        if parts:
+                            unit_name = parts[0]
+                            if unit_name.endswith(".service"):
+                                await self._to_thread("systemctl", "--user", "stop", unit_name)
+
+                await anyio.sleep(0.3)
+            except Exception:
+                pass
+
+            try:
+                # move any CAN interface still stuck in the guest netns back to root
+                for ns_if in guest_cans:
+                    await self._ns_exec(venusian_ns, "ip", "link", "set", ns_if, "down")
+                    await self._ns_exec(venusian_ns, "ip", "link", "set", ns_if, "netns", "1")
+                if guest_cans:
+                    await anyio.sleep(0.5)
+            except Exception:
+                pass
+
+            host_interfaces = await self._can_ifaces("root")
+
+            serial_to_host_if = {}
+            for iface in host_interfaces:
+                try:
+                    found_ser = None
+                    res = await self._ns_exec("root", "udevadm", "info", "-a", "-p", f"/sys/class/net/{iface}/device")
+                    if res.returncode == 0:
+                        for line in res.stdout.splitlines():
+                            line_stripped = line.strip()
+                            if line_stripped.startswith("ATTRS{serial}=") and "==" in line_stripped:
+                                val = line_stripped.split("==")[1].strip('" \t')
+                                if val and not val.startswith("0000:") and len(val) > 4:
+                                    found_ser = val
+                                    break
+                    if found_ser:
+                        serial_to_host_if[found_ser] = iface
+                except Exception:
+                    pass
+
+            rules = []
+            for entry in getattr(self, 'cfg', []):
+                if isinstance(entry, dict):
+                    udev_entries = entry.get('udev')
+                    if isinstance(udev_entries, list):
+                        rules.extend(udev_entries)
+                    elif isinstance(udev_entries, dict):
+                        rules.append(udev_entries)
+
+            setup_queue = []
+            for rule in rules:
+                match_block = rule.get('match', {})
+                data_block = rule.get('data', {})
+                target = match_block.get('KERNEL') or rule.get('target') or rule.get('name')
+                expected_serial = (data_block.get('serial') or rule.get('serial') or match_block.get('serial') or "").strip()
+                bitrate = data_block.get('bitrate') or rule.get('bitrate', '250000')
+                service = rule.get('service')
+                
+                if target and target.startswith('can') and expected_serial:
+                    matched_host = next((host_if for scanned_serial, host_if in serial_to_host_if.items() if scanned_serial.lower() == expected_serial.lower()), None)
+                    if matched_host:
+                        setup_queue.append({
+                            "host_if": matched_host,
+                            "target_name": target,
+                            "bitrate": str(bitrate),
+                            "service": service
+                        })
+
+            for item in setup_queue:
+                success = await self.setup_can(
+                    name=item["host_if"], 
+                    target_name=item["target_name"], 
+                    env={"BITRATE": item["bitrate"]}
+                )
+                if success:
+                    processed_can_devices.append({
+                        "name": item["target_name"],
+                        "service": item["service"]
+                    })
+                    await anyio.sleep(0.5)
+
+            if processed_can_devices:
+                await anyio.sleep(1.5)
+                for dev_info in processed_can_devices:
+                    name = dev_info["name"]
+                    for udev_attempt in range(10):
+                        try:
+                            res_idx = await self._ns_exec(venusian_ns, "cat", f"/sys/class/net/{name}/ifindex")
+                            ifindex = res_idx.stdout.strip()
+                            if res_idx.returncode == 0 and ifindex:
+                                udev_file = f"/run/udev/data/n{ifindex}"
+                                await self._ns_exec(venusian_ns, "mkdir", "-p", "/run/udev/data")
+                                content = f"I:{ifindex}\nE:SUBSYSTEM=net\nE:INTERFACE={name}\nE:DEVPATH=/devices/virtual/net/{name}\nE:ID_BUS=usb\nE:ID_NET_DRIVER=can\n"
+                                write_res = await self._ns_exec(venusian_ns, "sh", "-c", f'printf %s {shlex.quote(content)} > {udev_file}')
+                                if write_res.returncode != 0:
+                                    raise RuntimeError(write_res.stderr or "write failed")
+                                await self._ns_exec(venusian_ns, "sync")
+                                await anyio.sleep(1.0)
+                                verify_res = await self._ns_exec(venusian_ns, "test", "-s", udev_file)
+                                if verify_res.returncode == 0:
+                                    break
+                            else:
+                                await anyio.sleep(0.5)
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            logger.error("Failed to process CAN devices: %s", e)
+
+        if processed_can_devices:
+            try:
+                await anyio.sleep(2.0)
+                r = await self._to_thread("systemctl", "--user", "restart", "venus-platform.service")
+                if r.returncode != 0:
+                    raise subprocess.CalledProcessError(r.returncode, "systemctl restart venus-platform.service")
+                await anyio.sleep(1.0)
+
+                for dev_info in processed_can_devices:
+                    interface_name = dev_info["name"]
+                    service_template = dev_info["service"]
+                    target_service = f"{service_template}@{interface_name}.service"
+                    service_loaded = False
+
+                    for attempt in range(10):
+                        await anyio.sleep(0.5)
+                        check_svc = await self._to_thread("systemctl", "--user", "show", "--property=LoadState", "--value", target_service)
+                        if check_svc.returncode == 0 and check_svc.stdout.strip() == "loaded":
+                            service_loaded = True
+                            break
+                    
+                    if service_loaded:
+                        r = await self._to_thread("systemctl", "--user", "restart", target_service)
+                        if r.returncode != 0:
+                            raise subprocess.CalledProcessError(r.returncode, f"systemctl restart {target_service}")
+            except subprocess.CalledProcessError as batch_err:
+                logger.error("Error during CAN batch service setup: %s", batch_err)
+        else:
+            await self._to_thread("systemctl", "--user", "restart", "venus-platform.service")
+
     async def _run(self):
         monitor = udev.Monitor.from_netlink(self._udev)
-        monitor.filter_by(subsystem="tty")  # others?
-
         logger.debug("processing existing devices")
-        for dev in self._udev.list_devices(subsystem="tty",ID_BUS="usb",SUBSYSTEMS="platform|usb-serial"):
-            await self.process(dev)
+        for dev in self._udev.list_devices(subsystem="tty", ID_BUS="usb", SUBSYSTEMS="platform|usb-serial"):
+             await self.process(dev)
         logger.debug("waiting for changes")
+		    
+        await self._process_can_devices()
 
         n_empty = 0
         fd = socket.fromfd(monitor.fileno(), socket.AF_NETLINK, socket.SOCK_STREAM)
@@ -284,10 +499,18 @@ class Handler:
 
         return None
 
-
     async def process(self, dev):
         name = dev.sys_name
         service = self.find_cfg(dev)
+        if not service:
+            logger.warning("Unknown device: %s", dev.sys_name)
+            try:
+                rec = self.recommend_match(dev)
+                if rec:
+                    logger.warning("  possible 'match' rules:\n%s", rec)
+            except Exception as e:
+                logger.debug("Could not generate match recommendation: %s", e)
+            return
         if service is None:
             logger.warning("Unknown device: %r.", name)
             logger.warning("  possible 'match' rules:\n%s", self.recommend_match(dev))
@@ -334,7 +557,42 @@ sys_name: {dev.sys_name}  # Try to avoid this!
         if ve is not None:
             return ve
 
+    async def setup_can(self, name: str, target_name: str, env: dict) -> bool:
+        bitrate = env.get("BITRATE", "250000")
+        venusian_ns = self._get_netns()
+
+        check_host = await self._ns_exec("root", "ip", "link", "show", name, stdout=subprocess.DEVNULL)
+
+        if check_host.returncode == 0:
+            try:
+                for args in (
+                    ("ip", "link", "set", name, "down"),
+                    ("ip", "link", "set", name, "type", "can", "bitrate", str(bitrate)),
+                ):
+                    r = await self._ns_exec("root", *args)
+                    if r.returncode != 0:
+                        raise subprocess.CalledProcessError(r.returncode, args)
+                if name != target_name:
+                    r = await self._ns_exec("root", "ip", "link", "set", name, "name", target_name)
+                    if r.returncode != 0:
+                        raise subprocess.CalledProcessError(r.returncode, "rename")
+                    name = target_name
+                r = await self._ns_exec("root", "ip", "link", "set", name, "netns", venusian_ns)
+                if r.returncode != 0:
+                    raise subprocess.CalledProcessError(r.returncode, "netns move")
+            except subprocess.CalledProcessError:
+                return False
+        else:
+            name = target_name
+            check_container = await self._ns_exec(venusian_ns, "ip", "link", "show", name, stdout=subprocess.DEVNULL)
+            if check_container.returncode != 0:
+                return False
+
+        r = await self._ns_exec(venusian_ns, "ip", "link", "set", name, "up")
+        return r.returncode == 0
+
     async def service_for(self, uname):
+        """Retrieve the systemd Service and Unit interfaces for a given service name."""
         unit = await self.db_mgr.call_load_unit(uname)
 
         if self._intro_service is None:
@@ -392,7 +650,6 @@ sys_name: {dev.sys_name}  # Try to avoid this!
         if sr != "success":
             logger.error("Start %s: Job %r: %s", sname, job, sr)
 
-
     async def stop(self, name: str):
         """Stop the named service"""
         try:
@@ -409,7 +666,6 @@ sys_name: {dev.sys_name}  # Try to avoid this!
         sr = await s.get_result()
         if sr != "success":
             logger.error("Stop %s: Job %r: %s", sname, job, sr)
-
 
     def read_cfg(self, first:bool = False):
         cfg = [{}] * len(self.cfg_files) if first else self.cfg

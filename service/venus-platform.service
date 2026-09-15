@@ -1,0 +1,18 @@
+[Service]
+ExecStart=/opt/victronenergy/service/venus-platform/run %N
+Type=simple
+Restart=always
+RestartSec=10
+EnvironmentFile=-/etc/venusian/vars
+EnvironmentFile=-/etc/venusian/%u/vars
+EnvironmentFile=-/etc/venusian/%u/%N
+EnvironmentFile=-/run/user/%U/vars
+EnvironmentFile=-/run/user/%U/%N
+Environment="LD_LIBRARY_PATH=/opt/venus/usr/lib:/usr/lib/arm-linux-gnueabihf"
+Environment="QT_PLUGIN_PATH=/opt/venus/usr/lib/plugins"
+Environment="QT_DEBUG_PLUGINS=1"
+[Unit]
+Requires=dbus.service
+After=dbus.service
+Requires=localsettings.service
+After=localsettings.service
