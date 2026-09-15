@@ -535,8 +535,8 @@ ROOT=/
 FORCE=y
 SUB=()
 SUB_UPD=y
-REPO=https://build.smurf.noris.de/info/smurf.list
-REPOKEY=https://build.smurf.noris.de/info/smurf.archive.gpg
+REPO=http://build.smurf.noris.de/info/smurf.list
+REPOKEY=http://build.smurf.noris.de/info/smurf.archive.gpg
 replace=
 unset NAME DEST MNT img fast FB INST EXT
 
@@ -1090,17 +1090,17 @@ _END_
         (dbus-qwacs) continue ;; # ?
         (dbus-fronius) continue ;; # ?
         (dbus-adc) continue ;; # ?
-        (dbus-ble-sensors)
+        (dbus-ble-sensors) continue ;;
             # missing QEMU support
-            test $DEBARCH == "amd64" || continue
+            #test $DEBARCH == "amd64" || continue
 
             # BLE needs to access the host network namespace
-            echo >>$U AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
-            echo >>$U ExecStart=nsenter --net=/run/venusian/%u/initns /opt/victronenergy/dbus-ble-sensors/dbus-ble-sensors
-            ;;
+            #echo >>$U AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+            #echo >>$U ExecStart=nsenter --net=/run/venusian/%u/initns /opt/victronenergy/dbus-ble-sensors/dbus-ble-sensors
+            #;;
         (venus-html5-logger) continue ;; # what for?
         (venus-access) continue ;; # TODO needs replacement
-        # (venus-platform) continue ;; # TODO needs replacement
+        #(venus-platform) continue ;; # TODO needs replacement
         (dbus-mqtt) continue ;; # superseded by dbus-flashmq
         (flashmq)
             echo >>$U LimitNOFILE=65536
@@ -1114,8 +1114,8 @@ _END_
             echo >>$U ExecStart="$USRV/bin/start-gui"
             echo >>$U AmbientCapabilities=CAP_NET_BIND_SERVICE
             ;;
-        (ssh-tunnel) continue ;; # no remote access via some tunnel
-        (vrmlogger) continue ;; # no external logging
+        #(ssh-tunnel) continue ;; # no remote access via some tunnel
+        #(vrmlogger) continue ;; # no external logging
         (hub4control)
             echo >>$U "ExecStart=/opt/victronenergy/hub4control/hub4control --dbus session"
             ;;
@@ -1341,20 +1341,21 @@ pat() { # path [sub]
     if ! test -s "$fs" ; then return; fi
     p="$(vfind $p)"
     fchg "$fs" "$fd" || \
-        if test -x $p ; then
-            $p < $fs > $fd
+        if test -x "$p" ; then
+            "$p" < "$fs" > "$fd"
         else
             ft="$temp/$(basename "$fd")"
             cp "$fs" "$ft"
-            if ! patch $ft < $p ; then
-                echo "Patch '$p' (to file '$fs') did not apply." >&2
-                echo "Please create a versioned patch (see docs) and try again." >&2
-                exit 1
+            # Try applying the patch in dry-run mode first
+            if patch --dry-run -s "$ft" < "$p" >/dev/null 2>&1; then
+                patch "$ft" < "$p"
+                cp "$ft" "$fd"
+            else
+                # If it's not a valid patch, just copy the file directly
+                cp "$fs" "$fd"
             fi
-            cp "$ft" "$fd"
         fi
 }
-
 find "$HERE/patch" -type f | while read f ; do
     pat "$f" "$HERE/patch"
 done
