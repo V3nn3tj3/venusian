@@ -54,7 +54,7 @@ setup_tunnels()
     -o HostKeyAlias="$target_host" \
     -p "$target_port" \
     -R 0:localhost:2222 \
-    -i /usr/share/ssh-tunnel/id_rsa \
+    -i /var/lib/venusian/venus/.ssh/id_rsa \
     "ccgxlogin@$target_host" 2> "$ssh_output_file" &
 
   ssh_pid=$!

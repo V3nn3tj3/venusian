@@ -1,0 +1,16 @@
+[Unit]
+Description=SSH Tunnel Remote Support
+After=gui.service localsettings.service
+Requires=localsettings.service
+
+[Service]
+Type=simple
+ExecStart=env target_host=relaynearme46.victronenergy.com /opt/victronenergy/ssh-tunnel/setup-tunnel.sh
+Restart=always
+RestartSec=5
+EnvironmentFile=-/etc/venusian/vars
+EnvironmentFile=-/etc/venusian/%u/%p
+EnvironmentFile=-/etc/venusian/%u/%N
+EnvironmentFile=-/run/user/%U/vars
+EnvironmentFile=-/run/user/%U/%p
+EnvironmentFile=-/run/user/%U/%N

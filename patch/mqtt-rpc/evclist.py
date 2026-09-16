@@ -5,8 +5,8 @@ from urllib.parse import urlunparse
 from time import monotonic
 import dbus
 from dnslib.dns import DNSRecord, DNSQuestion, QTYPE
-from pymodbus.client.sync import ModbusTcpClient as ModbusClient
-from pymodbus.register_read_message import ReadHoldingRegistersResponse
+from pymodbus.client import ModbusTcpClient as ModbusClient
+from pymodbus.pdu.register_message import ReadHoldingRegistersResponse
 from lxml import etree as ElementTree
 from dbusutil import dbusConnection
 from streamcommand import BaseCommand

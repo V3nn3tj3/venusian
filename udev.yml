@@ -68,19 +68,19 @@ udev:
       ID_MODEL: MK3-USB_Interface
     service: mk3  # originally "mkx"
 
-  - match:
-      SUBSYSTEM: net
-      KERNEL: can0
-    service: vecan-dbus
-    data:
-      bitrate: 250000
-      serial: "2094366D514350072"
-
-  - match:
-      SUBSYSTEM: net
-      KERNEL: can1
-    service: can-bus-bms
-    data:
-      bitrate: 500000
-      serial: "2071366C514350072"
+#  - match:
+#      SUBSYSTEM: net
+#      KERNEL: can0
+#    service: vecan-dbus
+#    data:
+#      bitrate: 250000
+#      serial: "2094366D514350072"
+#
+# - match:
+#      SUBSYSTEM: net
+#      KERNEL: can1
+#    service: can-bus-bms
+#    data:
+#      bitrate: 500000
+#      serial: "2071366C514350072"
 

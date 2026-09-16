@@ -262,7 +262,7 @@ gen_user() {
     test ! -v FB || chr /sbin/adduser $NAME video 2>/dev/null
 	
 	# Add passwordless sudo for the venus user and ip commands
-	echo "venus ALL=(ALL) NOPASSWD: /usr/bin/ip, /usr/sbin/ip" | tee "$R/etc/sudoers.d/venus" > /dev/null
+	echo "venus ALL=(ALL) NOPASSWD: /usr/bin/ip, /usr/sbin/ip, /usr/sbin/sshd, /usr/bin/ssh-keygen" | tee "$R/etc/sudoers.d/venus" > /dev/null
 	chmod 0440 "$R/etc/sudoers.d/venus"
 
     SC="$LIBV/.config/systemd/user.control"
@@ -1055,6 +1055,11 @@ done
 WANTS="$SERVICE/default.target.wants"
 $Q echo Converting services
 mkdir -p "$WANTS"
+
+fln "$R/$USRV/service/net.connman.service" "$WANTS/net.connman.service"
+fln "$R/$USRV/service/ssh-tunnel.service" "$WANTS/ssh-tunnel.service"
+fln "$R/$USRV/service/openssh.service" "$WANTS/openssh.service"
+
 starters() {
     ls -1 "$DEST/opt/victronenergy/service/"
     echo "flashmq"
@@ -1099,8 +1104,21 @@ _END_
             #echo >>$U ExecStart=nsenter --net=/run/venusian/%u/initns /opt/victronenergy/dbus-ble-sensors/dbus-ble-sensors
             #;;
         (venus-html5-logger) continue ;; # what for?
-        (venus-access) continue ;; # TODO needs replacement
-        #(venus-platform) continue ;; # TODO needs replacement
+        #(venus-access) continue ;; # TODO needs replacement
+        (venus-platform)
+            mkdir -p "$OPTVIC/service/$fx"
+            (
+                cat <<_
+#!/bin/bash
+BASH_ARGV0="$fx"
+
+_
+                sed -e '/^#!.bin.sh/d' -e /etc.profile.d/d -e '/^exec 2>&1$/d' <$DEST/opt/victronenergy/service/$fx/run
+            ) | fcat "$OPTVIC/service/$fx/run"
+            echo >>$U ExecStart=/opt/victronenergy/service/$fx/run "%N"
+            echo >>$U Environment="LD_LIBRARY_PATH=/opt/venus/usr/lib:/usr/lib/arm-linux-gnueabihf"
+	    echo >>$U Environment="QT_PLUGIN_PATH=/opt/venus/usr/lib/plugins"
+	    ;; # TODO needs replacement
         (dbus-mqtt) continue ;; # superseded by dbus-flashmq
         (flashmq)
             echo >>$U LimitNOFILE=65536
@@ -1178,6 +1196,87 @@ _END_
 
     rm $U
 done
+
+mkdir -p $R/var/lib/venusian/venus/conf/flashmq.d
+
+VICRON_CA="/opt/venus/usr/share/ca-certificates/victronenergy/ccgx-ca.crt"
+SYS_CA="/etc/ssl/certs/ca-certificates.crt"
+
+if [ -f "$VICRON_CA" ] && [ -f "$SYS_CA" ]; then
+    if ! grep -q "Victron" "$SYS_CA" 2>/dev/null; then
+        echo "Adding Victron CA certificate to system store..."
+        echo "" >> "$SYS_CA"
+        echo "# Victron CCGX CA Added by Venusian" >> "$SYS_CA"
+        cat "$VICRON_CA" >> "$SYS_CA"
+    fi
+fi
+
+# Copy Victron CCGX CA pem file to system certs directory
+PEM_SRC="/opt/venus/etc/ssl/certs/ccgx-ca.pem"
+PEM_DST="/etc/ssl/certs/ccgx-ca.pem"
+
+if [ -f "$PEM_SRC" ]; then
+    mkdir -p "$(dirname "$PEM_DST")"
+    cp -f "$PEM_SRC" "$PEM_DST"
+    echo "Copied ccgx-ca.pem to /etc/ssl/certs/"
+fi
+
+# Symlink FlashMQ files from /opt/venus to /usr/share
+FLASHMQ_SRC="/opt/venus/usr/share/flashmq"
+FLASHMQ_DST="/usr/share/flashmq"
+
+if [ -d "$FLASHMQ_SRC" ]; then
+    mkdir -p "$FLASHMQ_DST"
+    for file in "$FLASHMQ_SRC"/*; do
+        if [ -e "$file" ]; then
+            ln -sf "$file" "$FLASHMQ_DST/$(basename "$file")"
+        fi
+    done
+    echo "FlashMQ files symlinked successfully."
+fi
+
+# 1. Create the vnctunnel system user if it doesn't exist
+if ! id -u vnctunnel >/dev/null 2>&1; then
+    echo "Creating vnctunnel system user..."
+    adduser --system --home /var/lib/venusian/venus/home/vnctunnel --shell /bin/false --no-create-home vnctunnel
+    echo "vnctunnel:vnc" | chpasswd
+fi
+
+# 2. Ensure home and .ssh directories exist with correct permissions
+VNC_HOST_HOME="/var/lib/venusian/venus/home/vnctunnel"
+
+# 1. Create directory structure and set secure permissions upfront
+mkdir -p "$VNC_HOST_HOME/.ssh"
+#usermod -d /var/lib/venusian/venus/home/vnctunnel vnctunnel
+
+# 2. Generate the RSA key if missing
+if [ ! -f "$VNC_HOST_HOME/.ssh/id_rsa" ]; then
+    echo "Generating SSH key for vnctunnel..."
+    ssh-keygen -t rsa -b 2048 -N "" -f "$VNC_HOST_HOME/.ssh/id_rsa"
+fi
+
+# 3. Ensure authorized_keys exists for incoming connections
+mkdir -p "$VNC_HOST_HOME/.ssh"
+if [ ! -f "$VNC_HOST_HOME/.ssh/authorized_keys" ]; then
+    ssh-keygen -y -f "$VNC_HOST_HOME/.ssh/id_rsa" > "$VNC_HOST_HOME/.ssh/authorized_keys"
+fi
+chmod 600 "$VNC_HOST_HOME/.ssh/authorized_keys"
+
+# 4. Apply correct ownership and strict SSH permissions in one pass
+chown -R venus:venus "$VNC_HOST_HOME"
+chmod 755 "$VNC_HOST_HOME"
+chmod 700 "$VNC_HOST_HOME/.ssh"
+chmod 600 "$VNC_HOST_HOME/.ssh/id_rsa"
+chmod 644 "$VNC_HOST_HOME/.ssh/id_rsa.pub"
+chmod 600 "$VNC_HOST_HOME/.ssh/authorized_keys"
+
+echo "VNCTunnel home and SSH keys configured successfully."
+mkdir -p /var/lib/venusian/venus/.ssh
+cp /opt/venus/usr/share/ssh-tunnel/id_rsa /var/lib/venusian/venus/.ssh/id_rsa
+chown -R venus:venus /var/lib/venusian/venus/.ssh
+chmod 700 /var/lib/venusian/venus/.ssh
+chmod 600 /var/lib/venusian/venus/.ssh/id_rsa
+cat /opt/venus/etc/ssh/ssh_known_hosts >> /etc/ssh/ssh_known_hosts
 
 # fcat "$SERVICE/etc-venus.mount" <<_END_
 # [Unit]
@@ -1352,7 +1451,7 @@ pat() { # path [sub]
                 cp "$ft" "$fd"
             else
                 # If it's not a valid patch, just copy the file directly
-                cp "$fs" "$fd"
+		cp "$p" "$fd"
             fi
         fi
 }
@@ -1382,6 +1481,9 @@ if ! rsync -rEt --delete --inplace --cvs-exclude "$HERE/ext/meter-library" "$OPT
     echo "Sync from 'ext/meter-library' to '$OPTVIC/dbus-modbus-client/' failed. Exiting." >&2
     exit 1
 fi
+
+mkdir -p "$OPTVIC/net.connman"
+rsync -rEt --delete --inplace --cvs-exclude "$HERE/patch/net.connman/" "$OPTVIC/net.connman/" 
 
 ################# mountpoint
 

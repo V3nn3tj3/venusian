@@ -9,4 +9,4 @@ ExecStart=/usr/bin/python3 /usr/lib/venusian/opt/net.connman/connman.py
 Restart=always
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
