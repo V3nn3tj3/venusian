@@ -515,6 +515,22 @@ _END_
         echo "EXT='$EXT'" >>"$R/$EV/vars"
     fi
 
+    # Apply correct ownership and strict SSH permissions in one pass
+    chown -R $NAME:venus "$VNC_HOST_HOME"
+    chmod 755 "$VNC_HOST_HOME"
+    chmod 700 "$VNC_HOST_HOME/.ssh"
+    chmod 600 "$VNC_HOST_HOME/.ssh/id_rsa"
+    chmod 644 "$VNC_HOST_HOME/.ssh/id_rsa.pub"
+    chmod 600 "$VNC_HOST_HOME/.ssh/authorized_keys"
+
+    echo "VNCTunnel home and SSH keys configured successfully."
+    mkdir -p /var/lib/venusian/venus/.ssh
+    cp /opt/venus/usr/share/ssh-tunnel/id_rsa /var/lib/venusian/venus/.ssh/id_rsa
+    chown -R $NAME:venus /var/lib/venusian/venus/.ssh
+    chmod 700 /var/lib/venusian/venus/.ssh
+    chmod 600 /var/lib/venusian/venus/.ssh/id_rsa
+    cat /opt/venus/etc/ssh/ssh_known_hosts >> /etc/ssh/ssh_known_hosts
+
     subs user
 } # END gen_user
 
@@ -1262,21 +1278,6 @@ if [ ! -f "$VNC_HOST_HOME/.ssh/authorized_keys" ]; then
 fi
 chmod 600 "$VNC_HOST_HOME/.ssh/authorized_keys"
 
-# 4. Apply correct ownership and strict SSH permissions in one pass
-chown -R venus:venus "$VNC_HOST_HOME"
-chmod 755 "$VNC_HOST_HOME"
-chmod 700 "$VNC_HOST_HOME/.ssh"
-chmod 600 "$VNC_HOST_HOME/.ssh/id_rsa"
-chmod 644 "$VNC_HOST_HOME/.ssh/id_rsa.pub"
-chmod 600 "$VNC_HOST_HOME/.ssh/authorized_keys"
-
-echo "VNCTunnel home and SSH keys configured successfully."
-mkdir -p /var/lib/venusian/venus/.ssh
-cp /opt/venus/usr/share/ssh-tunnel/id_rsa /var/lib/venusian/venus/.ssh/id_rsa
-chown -R venus:venus /var/lib/venusian/venus/.ssh
-chmod 700 /var/lib/venusian/venus/.ssh
-chmod 600 /var/lib/venusian/venus/.ssh/id_rsa
-cat /opt/venus/etc/ssh/ssh_known_hosts >> /etc/ssh/ssh_known_hosts
 
 # fcat "$SERVICE/etc-venus.mount" <<_END_
 # [Unit]
@@ -1440,19 +1441,21 @@ pat() { # path [sub]
     if ! test -s "$fs" ; then return; fi
     p="$(vfind $p)"
     fchg "$fs" "$fd" || \
-        if test -x "$p" ; then
+        ft="$temp/$(basename "$fd")"
+        cp "$fs" "$ft"
+        
+        # 1. Controleer EERST of het een geldig patch-bestand is
+        if patch --dry-run -s "$ft" < "$p" >/dev/null 2>&1; then
+            patch "$ft" < "$p"
+            cp "$ft" "$fd"
+            
+        # 2. Pas als het GEEN patch is, kijken we of het een uitvoerbaar filter-script is
+        elif test -x "$p" ; then
             "$p" < "$fs" > "$fd"
+            
+        # 3. Is het geen van beide? Dan is het een regulier vervangend bestand -> kopiëren
         else
-            ft="$temp/$(basename "$fd")"
-            cp "$fs" "$ft"
-            # Try applying the patch in dry-run mode first
-            if patch --dry-run -s "$ft" < "$p" >/dev/null 2>&1; then
-                patch "$ft" < "$p"
-                cp "$ft" "$fd"
-            else
-                # If it's not a valid patch, just copy the file directly
-		cp "$p" "$fd"
-            fi
+            cp "$p" "$fd"
         fi
 }
 find "$HERE/patch" -type f | while read f ; do
@@ -1465,6 +1468,26 @@ for S in "${SUB[@]}" ; do
         pat "$f" "$D"
     done
 done
+
+cpy() { # path [sub]
+    local p="$1"
+    local f="$(realpath --relative-to "$2" "$1")"
+    local fd="$OPTVIC/$f"
+    
+    # Gebruik fchg om te kijken of het bestand al bestaat/gewijzigd is
+    fchg "$p" "$fd" || \
+        cp "$p" "$fd"
+        
+    # Behoud de uitvoerbare rechten (+x) als het bronbestand die heeft
+    chmod 755 "$fd"
+}
+
+# 1. Loop door de centrale copy map
+if [ -d "$HERE/copy" ]; then
+    find "$HERE/copy" -type f | while read f ; do
+        cpy "$f" "$HERE/copy"
+    done
+fi
 
 cd
 mkdir -p "$OPTVIC/dbus-modbus-client"
@@ -1483,7 +1506,7 @@ if ! rsync -rEt --delete --inplace --cvs-exclude "$HERE/ext/meter-library" "$OPT
 fi
 
 mkdir -p "$OPTVIC/net.connman"
-rsync -rEt --delete --inplace --cvs-exclude "$HERE/patch/net.connman/" "$OPTVIC/net.connman/" 
+rsync -rEt --delete --inplace --cvs-exclude "$HERE/copy/net.connman/" "$OPTVIC/net.connman/" 
 
 ################# mountpoint
 
@@ -1516,6 +1539,8 @@ fi
 find "$R/$USRV" -type d -print0|xargs -0 chmod 755
 find "$R/$USRV/"{bin,opt} -type f -print0|xargs -0 chmod 755
 
+echo "I'm here to create someone"
+echo $NAME
 gen_user $NAME
 
 subs post
@@ -1525,4 +1550,8 @@ if test "$R" = "/" ; then
 	systemctl reload systemd-networkd || true  # may not be running
 fi
 
+# Start de hoofdservice van Venusian
+echo "Starting Venus OS"
+systemctl start venusian@venus
+echo "Restart flashmq after a few minutes for reasons... /usr/lib/venusian/bin/vctl restart flashmq"
 $Q echo "Done."

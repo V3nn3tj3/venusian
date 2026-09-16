@@ -13,7 +13,7 @@
 #
 # Run time for system with one EV charger: 400 ms.
 
-export XDG_RUNTIME_DIR="/run/user/110"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
 
 if [[ -z "$1"  ]]; then

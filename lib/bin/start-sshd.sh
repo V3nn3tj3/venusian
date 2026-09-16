@@ -1,12 +1,12 @@
 #!/bin/sh
 
-if [ ! -d /data/keys ]; then
-	mkdir /data/keys
+if [ ! -d /data/.ssh ]; then
+	mkdir /data/.ssh
 	# note: flashmq needs directory access as well
-	chmod 755 /data/keys
+	chmod 755 /data/.ssh
 else
-	rm -f /data/keys/ssh_host_dsa_key
-	rm -f /data/keys/ssh_host_dsa_key.pub
+	rm -f /data/.ssh/ssh_host_dsa_key
+	rm -f /data/.ssh/ssh_host_dsa_key.pub
 fi
 
 check_key() (
@@ -20,7 +20,7 @@ check_key() (
 
 gen_key() {
 	type=$1
-	key=/data/keys/ssh_host_${type}_key
+	key=/data/.ssh/ssh_host_${type}_key
 
 	check_key $key && return
 
@@ -40,4 +40,4 @@ if [ ! -d /var/run/sshd ]; then
 fi
 
 echo "*** Starting sshd..."
-exec sudo /usr/sbin/sshd -D -d -e -f /opt/venusian/lib/bin/sshd_config -h /data/keys/ssh_host_rsa_key -h /data/keys/ssh_host_ecdsa_key
+exec sudo /usr/sbin/sshd -D -e -f /opt/venusian/lib/bin/sshd_config -h /data/.ssh/ssh_host_rsa_key -h /data/.ssh/ssh_host_ecdsa_key
